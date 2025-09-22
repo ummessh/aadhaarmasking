@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from contextlib import asynccontextmanager
 import io
 import zipfile
@@ -10,129 +10,137 @@ import logging
 import os
 import tempfile
 
-# This imports the main function from your masking script.
-# Ensure 'prollyfinalam.py' is in the same directory.
+# Import masking + models
 from masking import main as mask_image_main
-
-# Assuming your classifier is in a 'src' folder
-import sys
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from src.detector import EnhancedEnsembleDetector
 from src.classifier import FalseNegativePreventionClassifier
 from src.pipeline import process_image
 
-# Configure logging
+# -----------------------
+# Logging
+# -----------------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Dictionary to hold our models
+# Dictionary for models
 ml_models = {}
 
+
+# -----------------------
+# Load Models on Startup
+# -----------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load the ML models during startup."""
-    print("🚀 Loading models and initializing pipeline...")
+    logger.info("🚀 Loading models...")
     ml_models["ensemble_detector"] = EnhancedEnsembleDetector()
     ml_models["ensemble_detector"].load_ensemble_models()
     ml_models["classifier"] = FalseNegativePreventionClassifier()
-    print("✅ Models loaded and pipeline ready.")
+    logger.info("✅ Models loaded successfully.")
     yield
     ml_models.clear()
 
+
 app = FastAPI(lifespan=lifespan)
+
 
 @app.get("/")
 def read_root():
-    return {"message": "Aadhaar Masking API. Send a POST request to /process-and-mask-zip/ to process a ZIP file."}
+    return {
+        "message": "Aadhaar Masking API",
+        "endpoints": {
+            "1. /classify-zip/": "Classify Aadhaar candidates inside a ZIP file",
+            "2. /label-image/": "Run labeling model on a single Aadhaar image",
+            "3. /mask-image/": "Mask Aadhaar image using labeling results"
+        }
+    }
 
-# --- CHANGE 1: REMOVED 'async' FROM THE FUNCTION DEFINITION ---
-@app.post("/process-and-mask-zip/")
-def process_zip_and_mask(file: UploadFile = File(...)):
-    """
-    Accepts a ZIP file, finds the most likely Aadhaar card, masks it,
-    and returns the masked image. This is a synchronous endpoint to handle blocking tasks.
-    """
+
+# -----------------------
+# 1. CLASSIFICATION API
+# -----------------------
+@app.post("/classify-zip/")
+def classify_zip(file: UploadFile = File(...)):
+    """Classify images inside a ZIP file and return Aadhaar candidates."""
     if file.content_type not in ["application/zip", "application/x-zip-compressed"]:
-        raise HTTPException(status_code=400, detail="File provided is not a ZIP file.")
+        raise HTTPException(status_code=400, detail="File must be a ZIP archive.")
 
+    results = []
+    zip_bytes = file.file.read()
+    with zipfile.ZipFile(io.BytesIO(zip_bytes), 'r') as zf:
+        for filename in zf.namelist():
+            image = None
+
+            # Handle image files
+            if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                image = cv2.imdecode(np.frombuffer(zf.read(filename), np.uint8), cv2.IMREAD_COLOR)
+
+            # Handle PDF files
+            elif filename.lower().endswith('.pdf'):
+                pdf_document = fitz.open(stream=zf.read(filename), filetype="pdf")
+                for page_num in range(len(pdf_document)):
+                    pix = pdf_document.load_page(page_num).get_pixmap(dpi=300)
+                    image = cv2.imdecode(np.frombuffer(pix.tobytes("ppm"), np.uint8), cv2.IMREAD_COLOR)
+
+            if image is not None:
+                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                _, classification_result = process_image(
+                    image_rgb,
+                    ml_models["ensemble_detector"],
+                    ml_models["classifier"]
+                )
+                results.append({
+                    "file": filename,
+                    "is_aadhaar": classification_result.get("is_aadhaar", False),
+                    "confidence": classification_result.get("confidence", 0.0)
+                })
+
+    return JSONResponse(content={"candidates": results})
+
+
+# -----------------------
+# 2. LABELING API
+# -----------------------
+@app.post("/label-image/")
+def label_image(file: UploadFile = File(...)):
+    """Run ensemble detector (labeling model) on a single image."""
+    image_bytes = file.file.read()
+    image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise HTTPException(status_code=400, detail="Invalid image file.")
+
+    # Run detector
+    detections = ml_models["ensemble_detector"].detect(image)
+    return JSONResponse(content={"labels": detections})
+
+
+# -----------------------
+# 3. MASKING API
+# -----------------------
+@app.post("/mask-image/")
+def mask_image(file: UploadFile = File(...)):
+    """Mask Aadhaar image using the masking script."""
     temp_dir = tempfile.TemporaryDirectory()
     try:
-        logger.info("Starting ZIP file processing.")
-        # --- CHANGE 2: REMOVED 'await' AND MODIFIED THE READ METHOD ---
-        zip_contents = file.file.read()
-        
-        zip_buffer = io.BytesIO(zip_contents)
-        aadhaar_candidates = []
+        # Save uploaded image
+        temp_path = os.path.join(temp_dir.name, "aadhaar.jpg")
+        with open(temp_path, "wb") as f:
+            f.write(file.file.read())
 
-        with zipfile.ZipFile(zip_buffer, 'r') as zf:
-            for filename in zf.namelist():
-                image_list = []
-                if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.webp')):
-                    image_bytes = zf.read(filename)
-                    image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
-                    if image is not None:
-                        image_list.append({"image": image, "source": filename})
-                elif filename.lower().endswith('.pdf'):
-                    pdf_bytes = zf.read(filename)
-                    pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
-                    for page_num in range(len(pdf_document)):
-                        page = pdf_document.load_page(page_num)
-                        pix = page.get_pixmap(dpi=300)
-                        image = cv2.imdecode(np.frombuffer(pix.tobytes("ppm"), np.uint8), cv2.IMREAD_COLOR)
-                        if image is not None:
-                            image_list.append({"image": image, "source": f"{filename} (page {page_num + 1})"})
-                
-                for item in image_list:
-                    logger.info(f"Classifying image from: {item['source']}")
-                    image_rgb = cv2.cvtColor(item["image"], cv2.COLOR_BGR2RGB)
-                    _, classification_result = process_image(
-                        image_rgb,
-                        ml_models["ensemble_detector"],
-                        ml_models["classifier"]
-                    )
-                    
-                    if classification_result.get('is_aadhaar'):
-                        logger.info(f"Aadhaar candidate found in {item['source']}")
-                        aadhaar_candidates.append({
-                            "source": item["source"],
-                            "confidence": classification_result.get('confidence', 0.0),
-                            "image": item["image"]
-                        })
+        # Run masking
+        masked_path = mask_image_main(image_path=temp_path, verbose=False)
+        if not masked_path or not os.path.exists(masked_path):
+            raise HTTPException(status_code=500, detail="Masking failed.")
 
-        if not aadhaar_candidates:
-            raise HTTPException(status_code=404, detail="No Aadhaar card found in the ZIP file.")
+        return StreamingResponse(open(masked_path, "rb"), media_type="image/jpeg")
 
-        best_candidate = sorted(aadhaar_candidates, key=lambda x: x['confidence'], reverse=True)[0]
-        logger.info(f"Best candidate is '{best_candidate['source']}'. Proceeding to mask.")
-
-        # --- INTEGRATION POINT (LOGIC UNCHANGED) ---
-        temp_image_path = os.path.join(temp_dir.name, "temp_aadhaar_image.jpg")
-        cv2.imwrite(temp_image_path, best_candidate["image"])
-        logger.info(f"Temporarily saved best candidate image to {temp_image_path}")
-        
-        masked_output_path = mask_image_main(image_path=temp_image_path, verbose=False)
-        
-        if not masked_output_path or not os.path.exists(masked_output_path):
-            raise HTTPException(status_code=500, detail="Masking process failed to produce an output file.")
-        
-        logger.info(f"Masking successful. Masked file at: {masked_output_path}")
-
-        with open(masked_output_path, "rb") as f:
-            masked_image_bytes = f.read()
-        
-        return StreamingResponse(io.BytesIO(masked_image_bytes), media_type="image/jpeg")
-
-    except HTTPException as he:
-        raise he
-    except Exception as e:
-        logger.error(f"An unexpected error occurred during processing: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {str(e)}")
     finally:
         temp_dir.cleanup()
-        logger.info("Cleaned up temporary files.")
 
+
+# -----------------------
+# Run with Uvicorn
+# -----------------------
 if __name__ == "__main__":
     import uvicorn
-    print("Starting Aadhaar Masking API server...")
-    print("Visit http://127.0.0.1:8000/docs for the interactive API documentation.")
+    logger.info("Starting Aadhaar Masking API server...")
     uvicorn.run(app, host="127.0.0.1", port=8000)
