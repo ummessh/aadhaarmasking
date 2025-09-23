@@ -1,21 +1,35 @@
+# Core ML/CV Libraries
 ultralytics>=8.3.0
-huggingface_hub
-supervision
-opencv-python
-pillow
-matplotlib
-numpy
-requests
-pytesseract
-easyocr
-ensemble-boxes
-torch
-python-dotenv
-fastapi
-uvicorn
-python-multipart
-hf_xet
-PyMuPDF
-imagehash
-paddleocr
-paddlepaddle
+torch>=2.0.0
+torchvision>=0.15.0
+numpy>=1.24.0
+opencv-python>=4.8.0
+pillow>=10.0.0
+matplotlib>=3.7.0
+
+# OCR Libraries
+pytesseract>=0.3.10
+easyocr>=1.7.0
+paddleocr>=2.7.0
+paddlepaddle>=2.5.0
+
+# Object Detection & Computer Vision
+supervision>=0.16.0
+ensemble-boxes>=1.0.9
+
+# Hugging Face & Model Management
+huggingface_hub>=0.17.0
+hf_xet>=0.2.0
+
+# API Framework
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# Document Processing
+PyMuPDF>=1.23.0
+imagehash>=4.3.1
+
+# Utilities
+python-dotenv>=1.0.0
+requests>=2.31.0
